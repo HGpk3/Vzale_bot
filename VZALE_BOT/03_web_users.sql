@@ -1,0 +1,8 @@
+-- 03_web_users.sql
+CREATE TABLE IF NOT EXISTS web_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  telegram_id INTEGER NOT NULL UNIQUE,
+  username TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
