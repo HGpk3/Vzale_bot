@@ -1,7 +1,5 @@
 import asyncio
-import os
 import logging
-import aiosqlite
 import json
 import uuid
 import random
@@ -10,43 +8,32 @@ import sqlite3
 import html
 import aiohttp
 import bcrypt
+import os
+import re
 
-import aiosqlite, re
-from dotenv import load_dotenv
+import aiosqlite
 from aiogram.exceptions import TelegramBadRequest
-
-
-
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, PollAnswer, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.fsm.state import State, StatesGroup
-
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
 
+from config import API_SECRET, BOT_TOKEN, DB_PATH
+from db import get_team_by_code, set_web_user
+
 
 def gen_invite_code(n: int = 6) -> str:
     # 6-символьный код из заглавных букв и цифр, можно поменять на только цифры, если хочешь
     alphabet = string.ascii_uppercase + string.digits
     return "".join(random.choice(alphabet) for _ in range(n))
-
-async def get_team_by_code(code: str) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT team_name FROM team_security WHERE invite_code = ?", (code.strip().upper(),))
-        row = await cur.fetchone()
-        return row[0] if row else None
-
-
-
-load_dotenv()
+# 📌 Бот читает настройки из .env (BOT_TOKEN, DB_PATH, API_SECRET).
+# Чтобы запустить локально: `python bot_with_broadcast_poll.py`
 WEB_AUTH_BASE = "https://vzale-site.vercel.app/me"
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = "tournament.db"
 GLOBAL_TOURNAMENT_ID = 0  # "за всё время" / глобальная выдача
 ADMINS = [409436763, 469460286]
 # === RATING COEFFICIENTS (simple) ===
@@ -112,30 +99,6 @@ class SuggestionForm(StatesGroup):
 
 class AdminReplyForm(StatesGroup):
     waiting_text = State()
-
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def set_web_user(telegram_id: int, username: str, password: str):
-    conn = get_db()
-    cur = conn.cursor()
-    pw_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    cur.execute(
-        """
-        INSERT INTO web_users (telegram_id, username, password_hash)
-        VALUES (?, ?, ?)
-        ON CONFLICT(telegram_id) DO UPDATE SET
-          username = excluded.username,
-          password_hash = excluded.password_hash
-        """,
-        (telegram_id, username, pw_hash),
-    )
-    conn.commit()
-    conn.close()
-
 
 
 @router.message(Command("web_login"))
@@ -1671,8 +1634,6 @@ async def achievements_tier(cb: CallbackQuery):
     """
     import aiosqlite
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
-    DB_PATH = "tournament.db"
     tier = cb.data.split(":", 1)[1]
 
     titles = {
@@ -1731,7 +1692,6 @@ async def achievements_tier(cb: CallbackQuery):
 
 
 import aiosqlite, re
-DB_PATH = "tournament.db"
 
 def esc_md(s: str) -> str:
     return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', s or "")
