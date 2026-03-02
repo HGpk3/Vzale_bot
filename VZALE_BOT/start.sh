@@ -1,3 +1,5 @@
 #!/bin/bash
+set -euo pipefail
+
 echo "Starting bot..."
-python3 bot_admin_aiogram3.py
+python3 -m app.main

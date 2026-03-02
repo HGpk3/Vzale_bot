@@ -1,7 +1,6 @@
 import asyncio
 import os
 import logging
-import aiosqlite
 import json
 import uuid
 import random
@@ -11,7 +10,7 @@ import html
 import aiohttp
 import bcrypt
 
-import aiosqlite, re
+import re
 from dotenv import load_dotenv
 from aiogram.exceptions import TelegramBadRequest
 
@@ -23,11 +22,12 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.state import State, StatesGroup
 
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
+from app import db_compat as aiosqlite
+from app.db_compat import sync_connect, using_postgres
 
 
 def gen_invite_code(n: int = 6) -> str:
@@ -64,7 +64,6 @@ K_MARGIN_STEP = 1
 K_TOP_SCORER = 5
 
 
-import asyncio
 
 db_lock = asyncio.Lock()
 
@@ -115,15 +114,15 @@ class AdminReplyForm(StatesGroup):
 
 
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = sync_connect(DB_PATH)
+    if not using_postgres():
+        conn.row_factory = sqlite3.Row
     return conn
 
 def set_web_user(telegram_id: int, username: str, password: str):
     conn = get_db()
-    cur = conn.cursor()
     pw_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    cur.execute(
+    conn.execute(
         """
         INSERT INTO web_users (telegram_id, username, password_hash)
         VALUES (?, ?, ?)
@@ -509,8 +508,6 @@ async def ensure_tables():
 
         await db.commit()
 
-from aiogram.fsm.state import StatesGroup, State
-
 class AchGrantGlobal(StatesGroup):
     user = State()
     ach = State()
@@ -519,8 +516,11 @@ class AchGrantGlobal(StatesGroup):
 async def main():
     logging.basicConfig(level=logging.INFO)
     logging.info("⏳ Инициализация БД...")
-    await ensure_tables()
-    logging.info("✅ Таблицы готовы")
+    if using_postgres():
+        logging.info("ℹ️ PostgreSQL режим: пропускаем SQLite bootstrap (ensure_tables)")
+    else:
+        await ensure_tables()
+        logging.info("✅ Таблицы готовы")
     await backfill_team_codes()
     logging.info("✅ Коды команд обновлены")
     logging.info("🚀 Запуск поллинга...")
@@ -638,40 +638,6 @@ async def ach_admin_global_grant(cb: CallbackQuery, state: FSMContext):
     ok = await award_player_achievement(None, uid, code, awarded_by=cb.from_user.id, note="global")
     await cb.answer("Выдано ✅" if ok else "Уже было", show_alert=False)
     await state.clear()
-
-async def backfill_global_from_existing() -> int:
-    """
-    Берёт все player_achievements с tournament_id <> 0 и добавляет такие же записи с tournament_id = 0,
-    если их ещё нет. Возвращает, сколько строк добавили.
-    """
-    added = 0
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT DISTINCT pa.user_id, pa.achievement_id
-            FROM player_achievements pa
-            WHERE pa.tournament_id <> 0
-              AND NOT EXISTS(
-                    SELECT 1 FROM player_achievements g
-                    WHERE g.tournament_id = 0
-                      AND g.user_id = pa.user_id
-                      AND g.achievement_id = pa.achievement_id
-              )
-        """)
-        rows = await cur.fetchall()
-        for uid, ach_id in rows:
-            try:
-                await db.execute("""
-                    INSERT INTO player_achievements(tournament_id, user_id, achievement_id)
-                    VALUES(0, ?, ?)
-                """, (uid, ach_id))
-                added += 1
-            except Exception:
-                pass
-        await db.commit()
-    return added
-
-
-import aiosqlite, time
 
 # нормализуем значения (защита от None/отрицательных)
 def _nz(x): 
@@ -829,8 +795,7 @@ async def backfill_team_codes():
     # ==== TOURNAMENT DB HELPERS ====
 
 def db():
-
-    return sqlite3.connect("tournament.db")
+    return sync_connect(DB_PATH)
 
 def get_tournaments(active_only=False):
     with db() as con:
@@ -912,11 +877,6 @@ def team_toggle_paid(tid:int, name:str) -> int:
         con.commit()
         return new_val
 
-def team_get_paid(tid:int, name:str) -> int:
-    with db() as con:
-        row = con.execute("SELECT paid FROM tournament_team_names WHERE tournament_id=? AND name=?", (tid,name)).fetchone()
-        return row[0] if row else 0
-
 def player_toggle_paid(user_id:int, tid:int) -> int:
     with db() as con:
         row = con.execute(
@@ -931,15 +891,6 @@ def player_toggle_paid(user_id:int, tid:int) -> int:
         )
         con.commit()
         return new_val
-
-def player_get_paid(user_id:int, tid:int) -> int:
-    with db() as con:
-        row = con.execute(
-            "SELECT paid FROM player_payments WHERE user_id=? AND tournament_id=?",
-            (user_id, tid)
-        ).fetchone()
-        return row[0] if row else 0
-
 
 def ms_add_match(tid:int, home:str, away:str, stage:str|None):
     with db() as con:
@@ -1232,30 +1183,21 @@ async def rating_scope(cb: CallbackQuery):
     tid = await _last_finished_tournament_id()
     if not tid:
         await cb.message.edit_text("Пока нет завершённых турниров.", reply_markup=_kb_rating_scope()); await cb.answer(); return
-        async with aiosqlite.connect(DB_PATH) as db:
-            cur = await db.execute("""
-                SELECT COALESCE(u.full_name, '—') AS display_name, r.rating, r.games
-                FROM player_ratings_by_tournament r
-                LEFT JOIN users u ON u.user_id = r.user_id
-                WHERE r.tournament_id = ?
-                ORDER BY r.rating DESC
-                LIMIT 10
-            """, (tid,))
-            rows = await cur.fetchall()
-        await cb.message.edit_text(_render_top_rows(rows, "ТОП-10 (последний турнир)"),
-                                reply_markup=_kb_rating_scope(), parse_mode="HTML")
-        await cb.answer()
-
-
-
-@router.callback_query(F.data == "suggest_feature")
-async def suggest_feature_start(cb: CallbackQuery, state: FSMContext):
-    await cb.message.edit_text(
-        "Опиши идею или проблему одним сообщением.\n"
-        "Можно приложить ссылки. Спасибо! 🙌"
-    )
-    await state.set_state(SuggestionForm.waiting_text)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+            SELECT COALESCE(u.full_name, '—') AS display_name, r.rating, r.games
+            FROM player_ratings_by_tournament r
+            LEFT JOIN users u ON u.user_id = r.user_id
+            WHERE r.tournament_id = ?
+            ORDER BY r.rating DESC
+            LIMIT 10
+        """, (tid,))
+        rows = await cur.fetchall()
+    await cb.message.edit_text(_render_top_rows(rows, "ТОП-10 (последний турнир)"),
+                            reply_markup=_kb_rating_scope(), parse_mode="HTML")
     await cb.answer()
+
+
 
 @router.callback_query(F.data == "t_myach_all")
 async def t_my_achievements_all(cb: CallbackQuery):
@@ -1344,22 +1286,6 @@ async def t_my_achievements(cb: CallbackQuery):
     ])
     await cb.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=kb)
     await cb.answer()
-
-
-@router.message(SuggestionForm.waiting_text)
-async def suggest_feature_save(message: Message, state: FSMContext):
-    txt = (message.text or "").strip()
-    if not txt:
-        await message.answer("Пустое сообщение. Введи текст идеи/багрепорта 🙏")
-        return
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO suggestions(user_id, text) VALUES(?,?)",
-            (message.from_user.id, txt)
-        )
-        await db.commit()
-    await state.clear()
-    await message.answer("✅ Спасибо! Мы получили твоё сообщение.")
 
 
 def kb_pick_team_public(tid:int):
@@ -1664,74 +1590,7 @@ async def achievements_all(cb: CallbackQuery):
             raise
     await cb.answer()
 
-@router.callback_query(F.data.startswith("ach_tier:"))
-async def achievements_tier(cb: CallbackQuery):
-    """
-    Рендер карточек выбранного уровня (MarkdownV2 + экранирование).
-    """
-    import aiosqlite
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
-    DB_PATH = "tournament.db"
-    tier = cb.data.split(":", 1)[1]
-
-    titles = {
-        "easy":     "🎯 *EASY* — для новичков",
-        "medium":   "⚡ *MEDIUM* — прояви себя",
-        "hard":     "👑 *HARD* — для постоянных игроков",
-        "ultra":    "💎 *ULTRA* — легендарные",
-        "ultimate": "👕 *ULTIMATE GOAL*",
-    }
-    if tier not in titles:
-        await cb.answer("Неизвестный раздел")
-        return
-
-    # навигация
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎯 EASY",    callback_data="ach_tier:easy"),
-         InlineKeyboardButton(text="⚡ MEDIUM",  callback_data="ach_tier:medium")],
-        [InlineKeyboardButton(text="👑 HARD",    callback_data="ach_tier:hard"),
-         InlineKeyboardButton(text="💎 ULTRA",   callback_data="ach_tier:ultra")],
-        [InlineKeyboardButton(text="👕 ULTIMATE", callback_data="ach_tier:ultimate")],
-        [InlineKeyboardButton(text="⬅️ К разделам", callback_data="ach_back")],
-    ])
-
-    # данные
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT COALESCE(emoji,'•'), title, COALESCE(description,''), order_index
-            FROM achievements
-            WHERE tier=?
-            ORDER BY order_index, title COLLATE NOCASE
-        """, (tier,))
-        rows = await cur.fetchall()
-
-    lines = [titles[tier], ""]
-    if not rows:
-        lines.append(esc_md2("В этом разделе пока пусто"))
-    else:
-        for emoji, title, desc, _ in rows:
-            # карточка: эмодзи + жирный тайтл + описание с новой строки
-            t = esc_md2(title)
-            d = esc_md2(desc)
-            if d:
-                lines.append(f"• {emoji} *{t}*\n  ▸ {d}")
-            else:
-                lines.append(f"• {emoji} *{t}*")
-            lines.append("")  # отступ
-
-    text = "\n".join(lines).strip()
-
-    try:
-        await cb.message.edit_text(text, parse_mode="MarkdownV2", reply_markup=kb)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            raise
-    await cb.answer()
-
-
-import aiosqlite, re
-DB_PATH = "tournament.db"
+import re
 
 def esc_md(s: str) -> str:
     return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', s or "")
@@ -2121,15 +1980,6 @@ async def achievements_tier(cb: CallbackQuery):
             raise
     await cb.answer()
 
-@router.callback_query(F.data == "ach_back")
-async def ach_back(cb: CallbackQuery):
-    await cb.message.edit_text(
-        f"Главное меню\nТекущий турнир: {get_current_tournament_name(cb.from_user.id)}",
-        reply_markup=kb_global(cb.from_user.id)
-    )
-    await cb.answer()
-
-
 def kb_user_stats_menu(tid:int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Таблица", callback_data=f"t_stats:{tid}")],
@@ -2481,13 +2331,6 @@ async def t_leave_yes(cb: CallbackQuery):
     )
     await cb.answer("Готово")
 
-def kb_leave_confirm(tid: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, выйти", callback_data=f"t_leave_yes:{tid}")],
-        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"tournament:{tid}")]
-    ])
-
-
 @router.callback_query(F.data == "back_global")
 async def back_global(cb: CallbackQuery):
     title = f"Главное меню\nТекущий турнир: {get_current_tournament_name(cb.from_user.id)}"
@@ -2530,9 +2373,11 @@ async def admin_tournament_name_input(message: Message, state: FSMContext):
     if not name:
         await message.answer("Введите название."); return
     with db() as con:
-        con.execute("INSERT INTO tournaments(name, status) VALUES(?, ?)", (name, "draft"))
+        tid = con.execute(
+            "INSERT INTO tournaments(name, status) VALUES(?, ?) RETURNING id",
+            (name, "draft"),
+        ).fetchone()[0]
         con.commit()
-        tid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
     await state.clear()
     await message.answer(
         f"Создан: {name}\nID: {tid}",
@@ -2966,11 +2811,8 @@ async def admin_ms_delete(cb: CallbackQuery):
         await cb.answer(f"Ошибка: {e}", show_alert=True)
         return
 
-    # обновляем список
-    await admin_ms_list(CallbackQuery(
-        id=cb.id, from_user=cb.from_user, chat_instance=cb.chat_instance,
-        message=cb.message, data=f"admin_ms_list:{tid}")
-    )
+    # после удаления возвращаем в меню матчей турнира
+    await cb.message.edit_text("✅ Матч удалён.", reply_markup=kb_admin_ms_menu(tid))
 
 
 
@@ -3089,30 +2931,6 @@ async def t_info(cb: CallbackQuery):
     await cb.message.edit_text("Выбери раздел:", reply_markup=kb_tinfo_sections(tid))
     await cb.answer()
 
-
-
-
-@router.callback_query(F.data == "admin_tournaments")
-async def admin_tournaments(cb: CallbackQuery):
-    if cb.from_user.id not in ADMINS:
-        await cb.answer("Нет доступа", show_alert=True); return
-    await cb.message.edit_text("🏆 Турниры:", reply_markup=kb_admin_tournaments_list())
-    await cb.answer()
-
-def kb_admin_tournament_manage(tid:int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Переименовать",            callback_data=f"admin_tournament_rename:{tid}")],
-        [InlineKeyboardButton(text="📅 Дата/место",                callback_data=f"admin_tournament_whenwhere:{tid}")],
-        [InlineKeyboardButton(text="🚪 Открыть регистрацию",       callback_data=f"admin_tournament_open:{tid}")],
-        [InlineKeyboardButton(text="🔒 Закрыть регистрацию",       callback_data=f"admin_tournament_close:{tid}")],
-        [InlineKeyboardButton(text="ℹ️ Редактировать разделы Info",callback_data=f"admin_tinfo:{tid}")],
-        [InlineKeyboardButton(text="👥 Команды турнира",           callback_data=f"admin_tt:{tid}")],
-        [InlineKeyboardButton(text="📊 Матчи / Счёт",              callback_data=f"admin_ms:{tid}")],
-        [InlineKeyboardButton(text="👁 Открыть как пользователь",  callback_data=f"open_tournament:{tid}")],
-        [InlineKeyboardButton(text="🔗 Скопировать deep-link",     callback_data=f"admin_tournament_link:{tid}")],
-        [InlineKeyboardButton(text="📦 Архивировать турнир",       callback_data=f"admin_tournament_archive:{tid}")],
-        [InlineKeyboardButton(text="⬅️ К списку турниров",         callback_data="admin_tournaments")],
-    ])
 
 
 
@@ -3412,79 +3230,6 @@ async def t_myteam(cb: CallbackQuery):
 
 
 
-@router.callback_query(F.data.startswith("rm:"))
-async def team_remove_by_uid(cb: CallbackQuery):
-    _, tid_s, uid_s = cb.data.split(":")
-    tid = int(tid_s)
-    remove_uid = int(uid_s)
-    actor_uid = cb.from_user.id
-
-    # узнаём команду текущего пользователя (актора)
-    async with aiosqlite.connect(DB_PATH) as adb:
-        cur = await adb.execute("SELECT team FROM users WHERE user_id=?", (actor_uid,))
-        row = await cur.fetchone()
-    if not row or not row[0]:
-        await cb.answer("Ты не в команде.", show_alert=True); return
-
-    team_name = row[0]
-
-    if remove_uid == actor_uid:
-        await cb.answer("Нельзя удалить самого себя.", show_alert=True); return
-
-    # удаляем из состава и отвязываем в users, только если действительно из этой команды
-    async with aiosqlite.connect(DB_PATH) as adb:
-        # проверяем, что удаляемый состоит в этой команде
-        cur = await adb.execute(
-            "SELECT 1 FROM teams WHERE team_name=? AND member_id=?",
-            (team_name, remove_uid)
-        )
-        if not await cur.fetchone():
-            await cb.answer("Этот игрок не в твоей команде.", show_alert=True); return
-
-        await adb.execute("DELETE FROM teams WHERE team_name=? AND member_id=?", (team_name, remove_uid))
-        await adb.execute("UPDATE users SET team=NULL WHERE user_id=? AND team=?", (remove_uid, team_name))
-        await adb.commit()
-
-        # имя для сообщения
-        cur = await adb.execute("SELECT full_name FROM users WHERE user_id=?", (remove_uid,))
-        rr = await cur.fetchone()
-        removed_name = rr[0] if rr and rr[0] else str(remove_uid)
-
-    await cb.answer("Удалён ✅")
-    # перерисуем экран "Моя команда" (покажет обновлённый состав и кнопки)
-    await t_myteam(cb)
-
- 
-
-@router.callback_query(F.data.startswith("team_remove_member:"))
-async def team_remove_member(cb: CallbackQuery):
-    _, tid, member_name = cb.data.split(":", 2)
-    tid = int(tid)
-
-    with db() as con:
-        con.execute("DELETE FROM teams WHERE team_name=(SELECT team FROM users WHERE user_id=?) AND member_name=?",
-                    (cb.from_user.id, member_name))
-        con.commit()
-
-    await cb.answer(f"Игрок {member_name} удалён", show_alert=True)
-    # обновляем экран "Моя команда"
-    await t_myteam(cb)
-
-
-@router.callback_query(F.data.startswith("confirm_remove:"))
-async def confirm_remove(cb: CallbackQuery):
-    _, team_id, remove_uid = cb.data.split(":")
-    team_id, remove_uid = int(team_id), int(remove_uid)
-
-    with db() as con:
-        con.execute("UPDATE users SET team_id=NULL WHERE user_id=?", (remove_uid,))
-        con.commit()
-        team_name = con.execute("SELECT team_name FROM teams WHERE id=?", (team_id,)).fetchone()[0]
-
-    await cb.message.edit_text(f"Игрок успешно удалён из команды {team_name}.", reply_markup=None)
-    await cb.answer("Удалён ✅", show_alert=True)
-
-
 def award_achievements_for_match(mid: int):
     with db() as con:
         match = con.execute("""
@@ -3614,8 +3359,7 @@ async def team_rm(cb: CallbackQuery):
         r = await cur.fetchone()
         removed_name = r[0] if r and r[0] else str(remove_uid)
 
-    await cb.message.edit_text(f"✅ Игрок <b>{removed_name}</b> удалён из команды <b>{team_name}</b>.",
-                               reply_markup=kb_tournament_menu(int(getattr(cb, "tid", 0)) if False else None))
+    await cb.answer(f"Игрок {removed_name} удалён ✅")
     # вернёмся в «Моя команда» заново, чтобы перечитать состав
     await t_myteam(cb)  # переиспользуем хендлер — он перерисует экран
 
@@ -4638,27 +4382,6 @@ async def live_evt_apply(cb: CallbackQuery):
     await cb.message.edit_text(_render_live_header(await _get_match(mid)), reply_markup=_kb_live_root(await _get_match(mid)), parse_mode="HTML")
     await cb.answer("Записано")
 
-# --- finish match ---
-
-@router.callback_query(F.data.startswith("live_finish:"))
-async def live_finish(cb: CallbackQuery):
-    mid = int(cb.data.split(":")[1])
-    m = await _get_match(mid)
-    if not m:
-        await cb.answer("Матч не найден", show_alert=True); return
-
-    async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("PRAGMA busy_timeout=5000;")
-            await db.execute("UPDATE matches_simple SET status='finished' WHERE id=?", (mid,))
-            await db.commit()
-        # после закрытия матча можно пересчитать всем участникам
-        await recalc_player_stats_for_tournament(m['tid'], user_id=None)
-
-    await cb.message.edit_text(_render_live_header(await _get_match(mid)) + "\n\n<b>Матч завершён.</b>", parse_mode="HTML", reply_markup=_kb_live_root(await _get_match(mid)))
-    await cb.answer("Матч закрыт")
-
-
 @router.callback_query(F.data == "admin_suggestions")
 async def admin_suggestions(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -4805,37 +4528,6 @@ async def delete_team(callback: CallbackQuery):
         await db.commit()
     await callback.message.answer(f"❌ Команда <b>{team_name}</b> удалена.", reply_markup=admin_menu_markup())
 
-@router.callback_query(F.data.startswith("admin_tt_team:"))
-async def admin_tt_team_menu(cb: CallbackQuery):
-    if cb.from_user.id not in ADMINS:
-        await cb.answer("Нет доступа", show_alert=True); return
-    _, tid, name = cb.data.split(":", 2)
-    tid = int(tid)
-    paid = tt_get_paid(tid, name)
-    status = "✅ Оплачено" if paid else "❌ Не оплачено"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💰 Переключить оплату", callback_data=f"admin_tt_toggle:{tid}:{name}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_tt:{tid}")]
-    ])
-    await cb.message.edit_text(f"Команда: {name}\nСтатус оплаты: {status}", reply_markup=kb)
-    await cb.answer()
-
-@router.callback_query(F.data.startswith("admin_tt_toggle:"))
-async def admin_tt_toggle(cb: CallbackQuery):
-    if cb.from_user.id not in ADMINS:
-        await cb.answer("Нет доступа", show_alert=True); return
-    _, tid, name = cb.data.split(":", 2)
-    tid = int(tid)
-    new_val = tt_toggle_paid(tid, name)
-    status = "✅ Оплачено" if new_val==1 else "❌ Не оплачено"
-    await cb.message.edit_text(f"Команда: {name}\nСтатус оплаты: {status}",
-                               reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                                   [InlineKeyboardButton(text="💰 Переключить оплату", callback_data=f"admin_tt_toggle:{tid}:{name}")],
-                                   [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_tt:{tid}")]
-                               ]))
-    await cb.answer("Статус обновлён")
-
-
 # --- Рассылка ---
 @router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
@@ -4979,7 +4671,8 @@ async def on_poll_answer(poll_answer: PollAnswer):
     option_id = poll_answer.option_ids[0] if poll_answer.option_ids else -1
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO poll_votes (poll_id, user_id, option_id) VALUES (?, ?, ?)",
+            "INSERT INTO poll_votes (poll_id, user_id, option_id) VALUES (?, ?, ?) "
+            "ON CONFLICT (poll_id, user_id) DO UPDATE SET option_id = excluded.option_id",
             (poll_id, user_id, option_id)
         )
         await db.commit()
