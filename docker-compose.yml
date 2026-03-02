@@ -1,0 +1,65 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vzale_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-vzale}
+      POSTGRES_USER: ${POSTGRES_USER:-vzale}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vzale_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vzale} -d ${POSTGRES_DB:-vzale}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ./site_backend
+    container_name: vzale_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-dev}
+      JWT_SECRET: ${JWT_SECRET:-change-me-super-strong}
+      ADMIN_IDS: ${ADMIN_IDS:-409436763,469460286}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-60}
+      REFRESH_TOKEN_TTL_MINUTES: ${REFRESH_TOKEN_TTL_MINUTES:-20160}
+      REFRESH_TOKEN_RETENTION_DAYS: ${REFRESH_TOKEN_RETENTION_DAYS:-30}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vzale}:${POSTGRES_PASSWORD:-vzale_password}@postgres:5432/${POSTGRES_DB:-vzale}?sslmode=disable
+    ports:
+      - "8100:8100"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health', timeout=3).read()\" || exit 1",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  bot:
+    build:
+      context: ./VZALE_BOT
+    container_name: vzale_bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      ADMIN_IDS: ${ADMIN_IDS:-409436763,469460286}
+      ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-60}
+      REFRESH_TOKEN_TTL_MINUTES: ${REFRESH_TOKEN_TTL_MINUTES:-20160}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vzale}:${POSTGRES_PASSWORD:-vzale_password}@postgres:5432/${POSTGRES_DB:-vzale}?sslmode=disable
+
+volumes:
+  postgres_data:

@@ -1,23 +1,37 @@
-# Vzale Bot
+# Vzale Platform
 
-## Repository Structure
-- `VZALE_BOT/` - bot application (runtime code)
-- `VZALE_BOT/app/main.py` - canonical entrypoint
-- `VZALE_BOT/bot_with_broadcast_poll.py` - current bot logic (legacy monolith)
-- `VZALE_BOT/scripts/` - operational scripts (migrations, maintenance)
-- `VZALE_BOT/sql/` - database schema files
-- `docs/` - architecture and migration docs
+## Components
+- `VZALE_BOT/` - Telegram bot service
+- `site_backend/` - FastAPI backend for website/admin
+- `site_web/` - frontend plan/scaffold
+- `docs/` - architecture, API, roadmap, runbooks
 
-## Run Bot Locally
+## Quick Start (Docker)
 ```bash
-cd VZALE_BOT
-pip install -r requirements.txt
-python -m app.main
+cp .env.example .env
+# edit .env (set BOT_TOKEN)
+docker compose up --build -d
 ```
 
-## Database Mode
-- If `DATABASE_URL` is set, bot uses PostgreSQL.
-- If `DATABASE_URL` is not set, bot uses local SQLite file `tournament.db`.
+Create the first website user:
+```bash
+docker compose exec api python scripts/create_web_user.py \
+  --telegram-id 409436763 \
+  --username admin \
+  --password change_me_please \
+  --database-url "postgresql://vzale:vzale_password@postgres:5432/vzale?sslmode=disable"
+```
 
-## PostgreSQL Migration
-See: `docs/POSTGRES_MIGRATION.md`.
+- API health: `http://127.0.0.1:8100/health`
+- API docs: `http://127.0.0.1:8100/docs`
+
+See full run guide: `docs/RUN_ALL.md`.
+
+
+## AI handoff
+- `docs/AI_HANDOFF_README.md`
+
+## Handy Commands
+- `make up` / `make down`
+- `make logs`
+- `make ps`
