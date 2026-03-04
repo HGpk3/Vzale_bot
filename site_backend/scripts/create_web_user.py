@@ -35,6 +35,17 @@ def main() -> int:
     with psycopg.connect(args.database_url) as conn, conn.cursor() as cur:
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS web_users (
+                id BIGSERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL UNIQUE,
+                username TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute(
+            """
             INSERT INTO web_users (telegram_id, username, password_hash)
             VALUES (%s, %s, %s)
             ON CONFLICT (telegram_id) DO UPDATE SET

@@ -1,6 +1,10 @@
 import bcrypt
 import jwt
-from fastapi import APIRouter, Depends, HTTPException
+import secrets
+import uuid
+from datetime import timedelta
+
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
 from psycopg.rows import dict_row
 
@@ -42,6 +46,38 @@ class CleanupRefreshIn(BaseModel):
     retention_days: int | None = None
 
 
+class BotLoginFinishIn(BaseModel):
+    session_id: str
+
+
+class BotLoginConfirmIn(BaseModel):
+    session_id: str
+    telegram_id: int
+    full_name: str | None = None
+    username: str | None = None
+
+
+def _issue_tokens(cur, uid: int) -> dict:
+    is_admin = uid in parse_admin_ids()
+    access_token = create_access_token(user_id=uid, is_admin=is_admin)
+    refresh_token, refresh_exp = create_refresh_token(user_id=uid)
+    refresh_hash = hash_refresh_token(refresh_token)
+    cur.execute(
+        """
+        INSERT INTO auth_refresh_tokens(token_hash, user_id, expires_at)
+        VALUES (%s, %s, %s)
+        """,
+        (refresh_hash, uid, refresh_exp),
+    )
+    return {
+        'access_token': access_token,
+        'refresh_token': refresh_token,
+        'token_type': 'bearer',
+        'user_id': uid,
+        'is_admin': is_admin,
+    }
+
+
 @router.post('/telegram/link')
 def telegram_link(payload: TelegramLinkIn) -> dict:
     with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -80,30 +116,173 @@ def login(payload: LoginIn) -> dict:
             raise HTTPException(status_code=401, detail='Invalid credentials')
 
         uid = int(row['telegram_id'])
-        is_admin = uid in parse_admin_ids()
+        token_payload = _issue_tokens(cur, uid)
+        conn.commit()
 
-        access_token = create_access_token(user_id=uid, is_admin=is_admin)
-        refresh_token, refresh_exp = create_refresh_token(user_id=uid)
-        refresh_hash = hash_refresh_token(refresh_token)
+    return ok(token_payload)
 
+
+@router.post('/bot-login/start')
+def bot_login_start() -> dict:
+    session_id = uuid.uuid4().hex
+    code = ''.join(secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(6))
+    expires_at = now_utc() + timedelta(seconds=settings.bot_login_ttl_seconds)
+
+    with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO auth_refresh_tokens(token_hash, user_id, expires_at)
-            VALUES (%s, %s, %s)
+            INSERT INTO auth_login_sessions(session_id, one_time_code, status, expires_at)
+            VALUES (%s, %s, 'pending', %s)
             """,
-            (refresh_hash, uid, refresh_exp),
+            (session_id, code, expires_at),
         )
         conn.commit()
 
     return ok(
         {
-            'access_token': access_token,
-            'refresh_token': refresh_token,
-            'token_type': 'bearer',
-            'user_id': uid,
-            'is_admin': is_admin,
+            'session_id': session_id,
+            'code': code,
+            'expires_at': expires_at.isoformat(),
+            'expires_in_seconds': settings.bot_login_ttl_seconds,
         }
     )
+
+
+@router.get('/bot-login/status/{session_id}')
+def bot_login_status(session_id: str) -> dict:
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT session_id, status, telegram_id, full_name, username, approved_at, consumed_at, expires_at
+            FROM auth_login_sessions
+            WHERE session_id=%s
+            """,
+            (session_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail='Login session not found')
+
+        if row['status'] == 'pending' and row['expires_at'] <= now_utc():
+            cur.execute("UPDATE auth_login_sessions SET status='expired' WHERE session_id=%s", (session_id,))
+            conn.commit()
+            row['status'] = 'expired'
+
+    status = str(row['status'])
+    return ok(
+        {
+            'session_id': session_id,
+            'status': status,
+            'approved': status in ('approved', 'consumed'),
+            'expired': status == 'expired',
+            'consumed': status == 'consumed',
+            'telegram_id': row.get('telegram_id'),
+            'full_name': row.get('full_name'),
+            'username': row.get('username'),
+            'approved_at': row.get('approved_at').isoformat() if row.get('approved_at') else None,
+            'expires_at': row.get('expires_at').isoformat() if row.get('expires_at') else None,
+        }
+    )
+
+
+@router.post('/bot-login/finish')
+def bot_login_finish(payload: BotLoginFinishIn) -> dict:
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT session_id, status, telegram_id, expires_at, consumed_at
+            FROM auth_login_sessions
+            WHERE session_id=%s
+            """,
+            (payload.session_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail='Login session not found')
+
+        if row['expires_at'] <= now_utc():
+            cur.execute("UPDATE auth_login_sessions SET status='expired' WHERE session_id=%s", (payload.session_id,))
+            conn.commit()
+            raise HTTPException(status_code=400, detail='Login session expired')
+
+        if row['status'] != 'approved':
+            raise HTTPException(status_code=409, detail='Login session is not approved yet')
+
+        if row['consumed_at'] is not None:
+            raise HTTPException(status_code=409, detail='Login session already consumed')
+
+        uid = int(row['telegram_id']) if row['telegram_id'] is not None else None
+        if uid is None:
+            raise HTTPException(status_code=400, detail='Login session has no telegram user')
+
+        token_payload = _issue_tokens(cur, uid)
+        cur.execute(
+            """
+            UPDATE auth_login_sessions
+            SET status='consumed', consumed_at=NOW()
+            WHERE session_id=%s
+            """,
+            (payload.session_id,),
+        )
+        conn.commit()
+
+    return ok(token_payload)
+
+
+@router.post('/bot-login/confirm')
+def bot_login_confirm(
+    payload: BotLoginConfirmIn,
+    x_bot_login_secret: str | None = Header(default=None, alias='X-Bot-Login-Secret'),
+) -> dict:
+    if x_bot_login_secret != settings.bot_login_secret:
+        raise HTTPException(status_code=401, detail='Invalid bot login secret')
+
+    with get_conn() as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT session_id, status, expires_at, consumed_at
+            FROM auth_login_sessions
+            WHERE session_id=%s
+            """,
+            (payload.session_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail='Login session not found')
+
+        if row['consumed_at'] is not None or row['status'] == 'consumed':
+            raise HTTPException(status_code=409, detail='Login session already consumed')
+
+        if row['expires_at'] <= now_utc():
+            cur.execute("UPDATE auth_login_sessions SET status='expired' WHERE session_id=%s", (payload.session_id,))
+            conn.commit()
+            raise HTTPException(status_code=400, detail='Login session expired')
+
+        cur.execute(
+            """
+            INSERT INTO users (user_id, full_name)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                full_name = COALESCE(EXCLUDED.full_name, users.full_name)
+            """,
+            (payload.telegram_id, payload.full_name),
+        )
+
+        cur.execute(
+            """
+            UPDATE auth_login_sessions
+            SET status='approved',
+                approved_at=NOW(),
+                telegram_id=%s,
+                full_name=COALESCE(%s, full_name),
+                username=COALESCE(%s, username)
+            WHERE session_id=%s
+            """,
+            (payload.telegram_id, payload.full_name, payload.username, payload.session_id),
+        )
+        conn.commit()
+
+    return ok({'approved': True, 'session_id': payload.session_id, 'telegram_id': payload.telegram_id})
 
 
 @router.post('/refresh')

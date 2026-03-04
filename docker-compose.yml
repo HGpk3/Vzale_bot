@@ -28,6 +28,7 @@ services:
     environment:
       APP_ENV: ${APP_ENV:-dev}
       JWT_SECRET: ${JWT_SECRET:-change-me-super-strong}
+      BOT_LOGIN_SECRET: ${BOT_LOGIN_SECRET:-change-me-bot-login-secret}
       ADMIN_IDS: ${ADMIN_IDS:-409436763,469460286}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
       ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-60}
@@ -56,10 +57,29 @@ services:
         condition: service_healthy
     environment:
       BOT_TOKEN: ${BOT_TOKEN}
+      BOT_LOGIN_SECRET: ${BOT_LOGIN_SECRET:-change-me-bot-login-secret}
+      SITE_API_BASE: http://api:8100
       ADMIN_IDS: ${ADMIN_IDS:-409436763,469460286}
       ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-60}
       REFRESH_TOKEN_TTL_MINUTES: ${REFRESH_TOKEN_TTL_MINUTES:-20160}
       DATABASE_URL: postgresql://${POSTGRES_USER:-vzale}:${POSTGRES_PASSWORD:-vzale_password}@postgres:5432/${POSTGRES_DB:-vzale}?sslmode=disable
+
+  web:
+    build:
+      context: ./site_web
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://127.0.0.1:8100}
+        NEXT_PUBLIC_BOT_USERNAME: ${NEXT_PUBLIC_BOT_USERNAME:-vzalebb_bot}
+    container_name: vzale_web
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://127.0.0.1:8100}
+      NEXT_PUBLIC_BOT_USERNAME: ${NEXT_PUBLIC_BOT_USERNAME:-vzalebb_bot}
+    ports:
+      - "3000:3000"
 
 volumes:
   postgres_data:

@@ -44,7 +44,8 @@ async def get_team_by_code(code: str) -> str | None:
 
 
 load_dotenv()
-WEB_AUTH_BASE = "https://vzale-site.vercel.app/me"
+SITE_API_BASE = os.getenv("SITE_API_BASE", "http://api:8100").rstrip("/")
+BOT_LOGIN_SECRET = os.getenv("BOT_LOGIN_SECRET", "change-me-bot-login-secret")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DB_PATH = "tournament.db"
 GLOBAL_TOURNAMENT_ID = 0  # "за всё время" / глобальная выдача
@@ -196,6 +197,38 @@ async def notify_admins(text: str):
             await bot.send_message(chat_id=admin_id, text=text)
         except Exception as e:
             logging.warning(f"Не удалось отправить сообщение админу {admin_id}: {e}")
+
+
+async def confirm_site_login_session(session_id: str, tg_user) -> tuple[bool, str]:
+    payload = {
+        "session_id": session_id,
+        "telegram_id": tg_user.id,
+        "full_name": (tg_user.full_name or "").strip() or None,
+        "username": tg_user.username,
+    }
+    headers = {"X-Bot-Login-Secret": BOT_LOGIN_SECRET}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{SITE_API_BASE}/v1/auth/bot-login/confirm",
+                json=payload,
+                headers=headers,
+                timeout=8,
+            ) as resp:
+                if resp.status == 200:
+                    return True, "✅ Вход на сайте подтверждён. Можешь возвращаться в браузер."
+                if resp.status == 400:
+                    return False, "⚠️ Сессия входа истекла. Запусти вход на сайте заново."
+                if resp.status == 404:
+                    return False, "⚠️ Сессия входа не найдена. Запусти вход на сайте заново."
+                if resp.status == 409:
+                    return False, "ℹ️ Эта сессия уже использована. Открой вход на сайте заново."
+                return False, "⚠️ Не удалось подтвердить вход. Попробуй ещё раз."
+    except Exception as e:
+        logging.warning(f"confirm_site_login_session failed: {e}")
+        return False, "⚠️ Сейчас не удалось связаться с сайтом. Попробуй чуть позже."
+
 
 async def get_all_recipients():
     """Возвращает множество chat_id всех пользователей, которых мы знаем.
@@ -2127,31 +2160,19 @@ async def start_cmd(message: Message, state: FSMContext):
     if len(args) > 1:
         payload = args[1]
 
-        # 1) веб-логин: /start web_<token>
-        if payload.startswith("web_"):
-            token = payload.split("_", 1)[1]
-            try:
-                async with aiohttp.ClientSession() as session:
-                    resp = await session.post(
-                        f"{WEB_AUTH_BASE}/api/auth/qr/confirm",
-                        json={"token": token, "telegramId": user_id},
-                        timeout=5,
-                    )
-                if resp.status == 200:
-                    await message.answer(
-                        "✅ Вход на сайте подтверждён!\n"
-                        "Можно вернуться в браузер, страница сама увидит это."
-                    )
-                else:
-                    await message.answer(
-                        "⚠️ Не удалось подтвердить вход на сайте.\n"
-                        "Токен мог устареть, попробуй заново открыть страницу входа."
-                    )
-            except Exception:
-                await message.answer(
-                    "⚠️ Сейчас не удалось связаться с сайтом.\n"
-                    "Попробуй повторить вход немного позже."
-                )
+        # 1) веб-логин через бота: /start login_<session_id>
+        if payload.startswith("login_"):
+            session_id = payload.split("_", 1)[1]
+            _, text = await confirm_site_login_session(session_id, message.from_user)
+            await message.answer(text)
+            return
+
+        # совместимость со старым deep-link: /start web_<session_id>
+        elif payload.startswith("web_"):
+            session_id = payload.split("_", 1)[1]
+            _, text = await confirm_site_login_session(session_id, message.from_user)
+            await message.answer(text)
+            return
 
         # 2) deep-link для турниров: /start tid_<id>
         elif payload.startswith("tid_"):
@@ -4392,7 +4413,7 @@ async def admin_suggestions(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT id, user_id, text, created_at FROM suggestions "
-            "WHERE status='new' ORDER BY datetime(created_at) DESC LIMIT 10"
+            "WHERE status='new' ORDER BY created_at DESC LIMIT 10"
         )
         rows = await cur.fetchall()
 
@@ -4612,6 +4633,26 @@ async def admin_poll_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminForm.waiting_poll_question)
 
 
+@router.message(AdminForm.waiting_poll_question)
+async def admin_poll_question(message: Message, state: FSMContext):
+    if message.text and message.text.lower().strip() == "отмена":
+        await state.clear()
+        await message.answer("❌ Отменено.", reply_markup=admin_menu_markup())
+        return
+
+    question = (message.text or "").strip()
+    if len(question) < 3:
+        await message.answer("⚠️ Вопрос слишком короткий. Пришли нормальный текст вопроса.")
+        return
+    if len(question) > 300:
+        await message.answer("⚠️ Вопрос слишком длинный (до 300 символов).")
+        return
+
+    await state.update_data(poll_question=question)
+    await state.set_state(AdminForm.waiting_poll_options)
+    await message.answer("✅ Вопрос сохранён.\nТеперь пришли варианты, каждый с новой строки (2-10 вариантов).")
+
+
 
 
 @router.message(AdminForm.waiting_poll_options)
@@ -4685,7 +4726,7 @@ async def admin_poll_results(callback: CallbackQuery):
             # берём последний опрос
             cur = await db.execute(
                 "SELECT group_id, question, options FROM polls_group "
-                "ORDER BY datetime(created_at) DESC LIMIT 1"
+                "ORDER BY created_at DESC LIMIT 1"
             )
             row = await cur.fetchone()
             if not row:
@@ -4775,7 +4816,7 @@ async def admin_poll_close(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT group_id FROM polls_group WHERE is_closed=0 "
-            "ORDER BY datetime(created_at) DESC LIMIT 1"
+            "ORDER BY created_at DESC LIMIT 1"
         )
         row = await cur.fetchone()
 

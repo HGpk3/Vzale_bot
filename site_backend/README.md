@@ -11,6 +11,7 @@ PowerShell:
 $env:DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require"
 $env:ADMIN_IDS="409436763,469460286"
 $env:JWT_SECRET="change-me-super-strong"
+$env:BOT_LOGIN_SECRET="change-me-bot-login-secret"
 $env:CORS_ORIGINS="http://localhost:3000,http://127.0.0.1:3000"
 uvicorn app.main:app --reload --port 8100
 ```
@@ -20,6 +21,7 @@ Bash:
 export DATABASE_URL='postgresql://USER:PASSWORD@HOST:5432/DBNAME?sslmode=require'
 export ADMIN_IDS='409436763,469460286'
 export JWT_SECRET='change-me-super-strong'
+export BOT_LOGIN_SECRET='change-me-bot-login-secret'
 export CORS_ORIGINS='http://localhost:3000,http://127.0.0.1:3000'
 uvicorn app.main:app --reload --port 8100
 ```
@@ -32,6 +34,11 @@ uvicorn app.main:app --reload --port 8100
 ## Implemented API
 - `/health`
 - `/v1/auth/*` (JWT + refresh rotation)
+  - includes bot-login flow:
+    - `POST /v1/auth/bot-login/start`
+    - `GET /v1/auth/bot-login/status/{session_id}`
+    - `POST /v1/auth/bot-login/confirm` (for bot)
+    - `POST /v1/auth/bot-login/finish`
 - `/v1/me/*`
 - `/v1/tournaments/*`
 - `/v1/teams/*`

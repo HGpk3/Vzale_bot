@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.config import settings
-from app.db import init_runtime_schema, purge_refresh_tokens
+from app.db import init_runtime_schema, purge_login_sessions, purge_refresh_tokens
 from app.routers import admin, auth, matches, teams, tournaments, users
 
 app = FastAPI(title=settings.app_name, version='0.2.0')
@@ -25,6 +25,7 @@ def on_startup() -> None:
     if settings.database_url:
         init_runtime_schema()
         purge_refresh_tokens(retention_days=settings.refresh_token_retention_days)
+        purge_login_sessions(retention_days=settings.bot_login_retention_days)
 
 
 @app.exception_handler(HTTPException)

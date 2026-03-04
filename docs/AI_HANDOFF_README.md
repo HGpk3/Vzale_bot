@@ -21,7 +21,7 @@
 Repository has 3 main parts:
 - `VZALE_BOT/` - Telegram bot (legacy monolith, already adapted with DB compatibility layer)
 - `site_backend/` - FastAPI backend for website/admin panel (real DB endpoints implemented)
-- `site_web/` - frontend scaffold/docs only (implementation pending)
+- `site_web/` - implemented Next.js frontend (player + admin routes)
 
 Database model:
 - Single source of truth is PostgreSQL.
@@ -82,7 +82,7 @@ Quick start:
 - No strict JWT auth/refresh persistence yet (current token format is lightweight MVP)
 - No rate limiting / anti-abuse / audit log yet
 - No formal service/repository split yet
-- No frontend app implementation yet
+- Frontend exists, but still needs product-level polish (E2E tests + final UX tuning)
 
 ## 5) Immediate Next Plan (Recommended Order)
 1. **Auth hardening**

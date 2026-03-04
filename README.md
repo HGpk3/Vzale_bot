@@ -3,7 +3,7 @@
 ## Components
 - `VZALE_BOT/` - Telegram bot service
 - `site_backend/` - FastAPI backend for website/admin
-- `site_web/` - frontend plan/scaffold
+- `site_web/` - Next.js frontend
 - `docs/` - architecture, API, roadmap, runbooks
 
 ## Quick Start (Docker)
@@ -24,6 +24,7 @@ docker compose exec api python scripts/create_web_user.py \
 
 - API health: `http://127.0.0.1:8100/health`
 - API docs: `http://127.0.0.1:8100/docs`
+- Web app: `http://127.0.0.1:3000`
 
 See full run guide: `docs/RUN_ALL.md`.
 
